@@ -17,6 +17,7 @@ buildscript {
         maven { url "https://kotlin.bintray.com/kotlin-eap" }
         maven { url "https://jetbrains.bintray.com/kotlin-native-dependencies" }
         maven { url "https://plugins.gradle.org/m2/" }
+        mavenLocal()
     }
     configurations.classpath {
         resolutionStrategy {
@@ -66,6 +67,7 @@ allprojects {
         maven { url "https://kotlin.bintray.com/kotlin-dev" }
         maven { url "https://kotlin.bintray.com/kotlin-eap" }
         maven { url "https://kotlin.bintray.com/kotlinx" }
+        mavenLocal()
     }
 }
 

@@ -9,6 +9,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import java.util.concurrent.*
 import kotlin.coroutines.*
+import kotlin.random.Random
 
 /**
  * Default instance of coroutine dispatcher.
@@ -33,21 +34,21 @@ internal object DefaultScheduler : ExperimentalCoroutineDispatcher() {
 // TODO make internal (and rename) after complete integration
 @InternalCoroutinesApi
 open class ExperimentalCoroutineDispatcher(
-    private val corePoolSize: Int,
-    private val maxPoolSize: Int,
-    private val idleWorkerKeepAliveNs: Long,
-    private val schedulerName: String = "CoroutineScheduler"
+        private val corePoolSize: Int,
+        private val maxPoolSize: Int,
+        private val idleWorkerKeepAliveNs: Long,
+        private val schedulerName: String = "CoroutineScheduler"
 ) : ExecutorCoroutineDispatcher() {
     constructor(
-        corePoolSize: Int = CORE_POOL_SIZE,
-        maxPoolSize: Int = MAX_POOL_SIZE,
-        schedulerName: String = DEFAULT_SCHEDULER_NAME
+            corePoolSize: Int = CORE_POOL_SIZE,
+            maxPoolSize: Int = MAX_POOL_SIZE,
+            schedulerName: String = DEFAULT_SCHEDULER_NAME
     ) : this(corePoolSize, maxPoolSize, IDLE_WORKER_KEEP_ALIVE_NS, schedulerName)
 
     @Deprecated(message = "Binary compatibility for Ktor 1.0-beta", level = DeprecationLevel.HIDDEN)
     constructor(
-        corePoolSize: Int = CORE_POOL_SIZE,
-        maxPoolSize: Int = MAX_POOL_SIZE
+            corePoolSize: Int = CORE_POOL_SIZE,
+            maxPoolSize: Int = MAX_POOL_SIZE
     ) : this(corePoolSize, maxPoolSize, IDLE_WORKER_KEEP_ALIVE_NS)
 
     override val executor: Executor
@@ -57,18 +58,18 @@ open class ExperimentalCoroutineDispatcher(
     private var coroutineScheduler = createScheduler()
 
     override fun dispatch(context: CoroutineContext, block: Runnable): Unit =
-        try {
-            coroutineScheduler.dispatch(block)
-        } catch (e: RejectedExecutionException) {
-            DefaultExecutor.dispatch(context, block)
-        }
+            try {
+                coroutineScheduler.dispatch(block)
+            } catch (e: RejectedExecutionException) {
+                DefaultExecutor.dispatch(context, block)
+            }
 
     override fun dispatchYield(context: CoroutineContext, block: Runnable): Unit =
-        try {
-            coroutineScheduler.dispatch(block, fair = true)
-        } catch (e: RejectedExecutionException) {
-            DefaultExecutor.dispatchYield(context, block)
-        }
+            try {
+                coroutineScheduler.dispatch(block, fair = true)
+            } catch (e: RejectedExecutionException) {
+                DefaultExecutor.dispatchYield(context, block)
+            }
 
     override fun close() = coroutineScheduler.close()
 
@@ -101,6 +102,19 @@ open class ExperimentalCoroutineDispatcher(
         return LimitingDispatcher(this, parallelism, TaskMode.NON_BLOCKING)
     }
 
+
+    public fun blockingSimulated(parallelism: Int = BLOCKING_DEFAULT_PARALLELISM): CoroutineDispatcher {
+        require(parallelism > 0) { "Expected positive parallelism level, but have $parallelism" }
+        return SimulationLimitedDispatcher(this, parallelism, TaskMode.PROBABLY_BLOCKING)
+    }
+
+    public fun limitedSimulated(parallelism: Int): CoroutineDispatcher {
+        require(parallelism > 0) { "Expected positive parallelism level, but have $parallelism" }
+        require(parallelism <= corePoolSize) { "Expected parallelism level lesser than core pool size ($corePoolSize), but have $parallelism" }
+        return SimulationLimitedDispatcher(this, parallelism, TaskMode.NON_BLOCKING)
+    }
+
+
     internal fun dispatchWithContext(block: Runnable, context: TaskContext, fair: Boolean) {
         try {
             coroutineScheduler.dispatch(block, context, fair)
@@ -129,14 +143,15 @@ open class ExperimentalCoroutineDispatcher(
     internal fun restore() = usePrivateScheduler() // recreate scheduler
 }
 
-private class LimitingDispatcher(
-    val dispatcher: ExperimentalCoroutineDispatcher,
-    val parallelism: Int,
-    override val taskMode: TaskMode
+private open class LimitingDispatcher(
+        val dispatcher: ExperimentalCoroutineDispatcher,
+        val parallelism: Int,
+        override val taskMode: TaskMode
 ) : ExecutorCoroutineDispatcher(), TaskContext, Executor {
 
     private val queue = ConcurrentLinkedQueue<Runnable>()
-    private val inFlightTasks = atomic(0)
+
+    protected val inFlightTasks = atomic(0)
 
     override val executor: Executor
         get() = this
@@ -147,7 +162,7 @@ private class LimitingDispatcher(
 
     override fun dispatch(context: CoroutineContext, block: Runnable) = dispatch(block, false)
 
-    private fun dispatch(block: Runnable, fair: Boolean) {
+    protected open fun dispatch(block: Runnable, fair: Boolean) {
         var taskToSchedule = block
         while (true) {
             // Commit in-flight tasks slot
@@ -224,5 +239,47 @@ private class LimitingDispatcher(
          */
         next = queue.poll() ?: return
         dispatch(next, true)
+    }
+}
+
+private class SimulationLimitedDispatcher(dispatcher: ExperimentalCoroutineDispatcher,
+                                          parallelism: Int,
+                                          taskMode: TaskMode) : LimitingDispatcher(dispatcher, parallelism, taskMode) {
+
+    private val billsBackingCollection = mutableListOf<Runnable?>()
+
+    private val inProgress = atomic<Boolean>(false)
+
+    override fun dispatch(block: Runnable, fair: Boolean) {
+        println("block: ${Thread.currentThread().id} ... $block")
+        var taskToSchedule = block
+        // Parallelism limit is reached, add task to the queue
+        synchronized(billsBackingCollection) { billsBackingCollection.add(taskToSchedule) }
+
+        // Fast path, if parallelism limit is not reached, dispatch task and return
+        if (inProgress.getAndSet(true)) {
+            billsBackingCollection.add(taskToSchedule)
+        } else {
+            taskToSchedule = poll(billsBackingCollection) ?: return
+            dispatcher.dispatchWithContext(taskToSchedule, this, fair)
+            inProgress.getAndSet(false);
+        }
+    }
+
+    override fun afterTask() {
+        var next = poll(billsBackingCollection)
+        // If we have pending tasks in current blocking context, dispatch first
+        if (next != null) {
+            dispatcher.dispatchWithContext(next, this, true)
+            return
+        }
+    }
+
+    private fun poll(collection: MutableList<Runnable?>): Runnable? = synchronized(collection) {
+        return if (collection.size == 0) {
+            null
+        } else {
+            collection.removeAt(Random.nextInt(collection.size))
+        }
     }
 }
